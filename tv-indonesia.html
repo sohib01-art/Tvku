@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#12141f">
+<title>TV Indonesia</title>
+<style>
+:root{--bg:#12141f;--card:#1b1e2e;--line:#2a2e45;--tx:#e9eaf2;--mute:#8b90ad;--live:#ff4d5e;--ok:#3dd6c6}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+body{padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+.wrap{max-width:960px;margin:0 auto;padding:0 12px 24px}
+.stage{position:sticky;top:0;z-index:5;background:var(--bg);padding:10px 0 8px}
+video{width:100%;aspect-ratio:16/9;background:#000;border-radius:10px;display:block}
+.now{display:flex;align-items:center;gap:8px;margin-top:8px;min-height:24px}
+.now b{font-size:16px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--mute)}
+.dot.on{background:var(--live);box-shadow:0 0 0 4px rgba(255,77,94,.2)}
+.msg{color:var(--mute);font-size:13px}
+input,button{font:inherit;color:inherit}
+input{width:100%;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+input:focus,button:focus-visible,li:focus-visible{outline:2px solid var(--ok);outline-offset:1px}
+.chips{display:flex;gap:6px;overflow-x:auto;padding:10px 0;scrollbar-width:none}
+.chip{flex:none;background:var(--card);border:1px solid var(--line);border-radius:999px;padding:6px 13px;cursor:pointer}
+.chip.on{background:var(--tx);color:var(--bg);border-color:var(--tx)}
+ul{list-style:none;margin:0;padding:0;display:grid;gap:6px}
+li{display:flex;align-items:center;gap:12px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px 10px;cursor:pointer}
+li.cur{border-color:var(--live)}
+li.dead{opacity:.45}
+.num{width:34px;text-align:right;font-size:22px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--mute)}
+li.cur .num{color:var(--live)}
+.logo{width:40px;height:30px;object-fit:contain;flex:none}
+.nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.nm small{display:block;color:var(--mute);font-size:12px}
+.fav{background:none;border:0;font-size:20px;cursor:pointer;color:var(--mute);padding:4px 8px}
+.fav.on{color:#ffc247}
+details{margin-top:16px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+summary{cursor:pointer}
+.row{display:flex;gap:6px;margin-top:10px}
+.row button{background:var(--ok);color:#06231f;border:0;border-radius:10px;padding:0 16px;font-weight:600;cursor:pointer}
+.legal{color:var(--mute);font-size:12px;margin-top:16px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="stage">
+    <video id="v" controls playsinline></video>
+    <div class="now"><span class="dot" id="dot"></span><b id="now">Pilih channel untuk mulai menonton</b><span class="msg" id="st"></span></div>
+  </div>
+  <input id="q" type="search" placeholder="Cari channel" aria-label="Cari channel">
+  <div class="chips" id="chips"></div>
+  <ul id="list"></ul>
+  <p class="msg" id="info"></p>
+  <details>
+    <summary>Sumber playlist</summary>
+    <div class="row"><input id="url" aria-label="URL playlist M3U"><button id="load">Muat</button></div>
+    <p class="msg">Tempel alamat file .m3u milik Anda sendiri, lalu tekan Muat.</p>
+  </details>
+  <p class="legal">Aplikasi ini hanya pemutar. Channel berasal dari playlist publik pihak ketiga dan tidak disimpan di server kami. Hak siaran tetap milik pemiliknya.</p>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>
+<script>
+const DEF = 'https://iptv-org.github.io/iptv/countries/id.m3u';
+const $ = id => document.getElementById(id);
+const v = $('v');
+let channels = [], cat = 'Semua', hls = null, cur = null, skipped = 0;
+const dead = new Set();
+
+const store = {
+  get(k, d){ try { const x = localStorage.getItem(k); return x ? JSON.parse(x) : d; } catch { return d; } },
+  set(k, x){ try { localStorage.setItem(k, JSON.stringify(x)); } catch {} }
+};
+let favs = new Set(store.get('favs', []));
+let last = store.get('last', null);
+
+function parseM3U(text){
+  const out = [], lines = text.split(/\r?\n/);
+  let meta = null;
+  for (const raw of lines){
+    const l = raw.trim();
+    if (l.startsWith('#EXTINF')){
+      meta = {
+        name: (l.split(',').pop() || 'Tanpa nama').trim(),
+        logo: (l.match(/tvg-logo="([^"]*)"/) || [])[1] || '',
+        group: (l.match(/group-title="([^"]*)"/) || [])[1] || 'Lainnya'
+      };
+    } else if (l && !l.startsWith('#') && meta){
+      out.push({...meta, url: l}); meta = null;
+    }
+  }
+  return out;
+}
+
+async function loadPlaylist(url){
+  $('info').textContent = 'Memuat playlist...';
+  try {
+    const r = await fetch(url, {cache: 'no-cache'});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const text = await r.text();
+    store.set('cache', {url, text});
+    useText(text);
+  } catch (e) {
+    const c = store.get('cache', null);
+    if (c){ useText(c.text); $('info').textContent = 'Tidak ada koneksi, memakai playlist tersimpan.'; }
+    else $('info').textContent = 'Gagal memuat playlist (' + e.message + '). Cek koneksi atau ganti sumber.';
+  }
+}
+
+function useText(text){
+  let all = parseM3U(text);
+  const secure = location.protocol === 'https:';
+  skipped = secure ? all.filter(c => c.url.startsWith('http:')).length : 0;
+  if (secure) all = all.filter(c => !c.url.startsWith('http:'));
+  const seen = new Set();
+  channels = all.filter(c => !seen.has(c.url) && seen.add(c.url));
+  render();
+}
+
+function cats(){
+  const g = [...new Set(channels.map(c => c.group))].sort();
+  return ['Semua', 'Favorit', ...g];
+}
+
+function render(){
+  const chips = $('chips'); chips.textContent = '';
+  for (const k of cats()){
+    const b = document.createElement('button');
+    b.className = 'chip' + (k === cat ? ' on' : ''); b.textContent = k;
+    b.onclick = () => { cat = k; render(); };
+    chips.appendChild(b);
+  }
+  const q = $('q').value.trim().toLowerCase();
+  const rows = channels.filter(c =>
+    (cat === 'Semua' || (cat === 'Favorit' ? favs.has(c.url) : c.group === cat)) &&
+    (!q || c.name.toLowerCase().includes(q)));
+  const ul = $('list'); ul.textContent = '';
+  rows.forEach((c, i) => {
+    const li = document.createElement('li');
+    li.tabIndex = 0;
+    li.className = (cur && cur.url === c.url ? 'cur ' : '') + (dead.has(c.url) ? 'dead' : '');
+    const n = document.createElement('span'); n.className = 'num'; n.textContent = i + 1;
+    li.appendChild(n);
+    if (c.logo){ const im = document.createElement('img'); im.className = 'logo'; im.loading = 'lazy'; im.alt = ''; im.src = c.logo; im.onerror = () => im.remove(); li.appendChild(im); }
+    const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = c.name;
+    const sm = document.createElement('small'); sm.textContent = dead.has(c.url) ? 'Tidak bisa diputar' : c.group; nm.appendChild(sm);
+    li.appendChild(nm);
+    const f = document.createElement('button');
+    f.className = 'fav' + (favs.has(c.url) ? ' on' : ''); f.textContent = favs.has(c.url) ? '★' : '☆';
+    f.setAttribute('aria-label', 'Favorit');
+    f.onclick = e => { e.stopPropagation(); favs.has(c.url) ? favs.delete(c.url) : favs.add(c.url); store.set('favs', [...favs]); render(); };
+    li.appendChild(f);
+    li.onclick = () => play(c);
+    li.onkeydown = e => { if (e.key === 'Enter') play(c); };
+    ul.appendChild(li);
+  });
+  const d = dead.size;
+  $('info').textContent = rows.length + ' channel' + (d ? ', ' + d + ' tidak bisa diputar' : '') +
+    (skipped ? '. ' + skipped + ' channel http disembunyikan karena halaman memakai https' : '') + '.';
+}
+
+function setStatus(t, on){ $('st').textContent = t; $('dot').className = 'dot' + (on ? ' on' : ''); }
+
+function fail(c){
+  dead.add(c.url); setStatus('Gagal', false);
+  $('now').textContent = c.name + ' tidak bisa diputar. Coba channel lain.';
+  render();
+}
+
+function play(c){
+  cur = c; store.set('last', c.url);
+  $('now').textContent = c.name; setStatus('Memuat', false);
+  if (hls){ hls.destroy(); hls = null; }
+  v.removeAttribute('src'); v.load();
+  let timer = setTimeout(() => { if (cur === c && v.readyState < 2) fail(c); }, 15000);
+  v.onplaying = () => { clearTimeout(timer); dead.delete(c.url); setStatus('LIVE', true); };
+  v.onerror = () => { clearTimeout(timer); fail(c); };
+  if (window.Hls && Hls.isSupported()){
+    hls = new Hls({enableWorker: true});
+    hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal){ clearTimeout(timer); fail(c); } });
+    hls.loadSource(c.url); hls.attachMedia(v);
+    v.play().catch(() => {});
+  } else if (v.canPlayType('application/vnd.apple.mpegurl')){
+    v.src = c.url; v.play().catch(() => {});
+  } else { fail(c); }
+  render();
+}
+
+$('q').oninput = render;
+$('url').value = (store.get('cache', null) || {}).url || DEF;
+$('load').onclick = () => loadPlaylist($('url').value.trim() || DEF);
+loadPlaylist($('url').value).then(() => {
+  const c = channels.find(x => x.url === last);
+  if (c){ cur = c; $('now').textContent = c.name + ' (terakhir ditonton, tekan untuk putar)'; render(); }
+});
+</script>
+</body>
+</html>
